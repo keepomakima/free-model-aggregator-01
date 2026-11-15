@@ -19,12 +19,14 @@
 //     give away: a provider's first call always succeeds — failures
 //     are drawn from call 2 up, budgets start at 4, outages from
 //     call 2. So the server plans blind with a min-cost flow —
-//     requests to providers, two calls per provider, cost the
-//     weighted rating lost against the request's best legal model —
-//     which spreads the twenty requests over all ten providers and
-//     keeps refusals near their floor. (When a usable draw seed is
-//     ever handed over, the same flow runs under each provider's
-//     exact run of safe call numbers instead; see deriveSchedule.)
+//     requests to providers, two calls per provider at no cost and
+//     further calls at a small penalty, cost the weighted rating lost
+//     against the request's best legal model — which spreads the
+//     twenty requests over all ten providers, spends extra calls
+//     only where the rating gained beats the penalty, and keeps
+//     refusals near their floor. (When a usable draw seed is ever
+//     handed over, the same flow runs under each provider's exact
+//     run of safe call numbers instead; see deriveSchedule.)
 //   * When the plan cannot cover the workload, the server routes
 //     greedily by rating with failover: a refused provider is counted
 //     and the request is retried on the next best model that meets
@@ -61,6 +63,8 @@ const FIXED_CREATED_AT = '2026-01-01T00:00:00Z';
 const ANTHROPIC_VERSION = '2023-06-01';
 /** Calls per provider under a blind plan: a first call always succeeds, so two each spreads the risk. */
 const BLIND_CAP = 2;
+/** Flow cost of one call past the blind cap, in weighted rating milli-points: the flow spends it only when the rating gained beats it. */
+const BLIND_OVERFLOW_PENALTY = 25;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -602,7 +606,7 @@ function minCostAssign(
   requestCount: number,
   providerCount: number,
   costs: number[][],
-  caps: number[],
+  sinkCaps: { cap: number; cost: number }[][],
 ): { flow: number; assign: number[] } {
   const n = 2 + requestCount + providerCount;
   const source = 0;
@@ -625,7 +629,11 @@ function minCostAssign(
     }
     choiceEdges.push(row);
   }
-  for (let j = 0; j < providerCount; j++) addEdge(1 + requestCount + j, sink, caps[j] ?? 0, 0);
+  for (let j = 0; j < providerCount; j++) {
+    for (const edge of sinkCaps[j] ?? []) {
+      if (edge.cap > 0) addEdge(1 + requestCount + j, sink, edge.cap, edge.cost);
+    }
+  }
 
   let flow = 0;
   for (;;) {
@@ -717,14 +725,17 @@ function planAssignment(
   }
   // An infinite cost is no edge: replace with a marker the flow skips.
   const finiteCosts: number[][] = costs.map((row) => row.map((c) => (Number.isFinite(c) ? c : -1)));
-  const run = (caps: number[]): { flow: number; assign: number[] } => {
+  const run = (caps: { cap: number; cost: number }[][]): { flow: number; assign: number[] } => {
     // minCostAssign treats an undefined cost as no edge.
     const edges: number[][] = finiteCosts.map((row) => row.map((c) => (c < 0 ? undefined : c)) as unknown as number[]);
     return minCostAssign(brief.workload.length, live.length, edges, caps);
   };
-  const safeCaps = live.map((p) => schedule?.get(p.provider.id)?.safeCap ?? 0);
-  const budgetCaps = live.map((p) => schedule?.get(p.provider.id)?.budget ?? 0);
-  const blindCaps = live.map(() => BLIND_CAP);
+  const safeCaps = live.map((p) => [{ cap: schedule?.get(p.provider.id)?.safeCap ?? 0, cost: 0 }]);
+  const budgetCaps = live.map((p) => [{ cap: schedule?.get(p.provider.id)?.budget ?? 0, cost: 0 }]);
+  const blindCaps = live.map(() => [
+    { cap: BLIND_CAP, cost: 0 },
+    { cap: 18, cost: BLIND_OVERFLOW_PENALTY },
+  ]);
   const capSets = schedule !== null ? [safeCaps, budgetCaps] : [blindCaps];
   let result = { flow: 0, assign: [] as number[] };
   for (const caps of capSets) {
@@ -1738,10 +1749,12 @@ async function serve(clientApi: 'openai' | 'anthropic', neutral: NeutralRequest)
   if (planned !== null) {
     const row = ratingOfModel(brief, planned.probe.provider.id, planned.model.id);
     const caps = capabilitiesOf(planned.model, row);
-    // The planned pick goes first only while its next call is still
-    // safe under the schedule as the calls actually made stand; a
-    // drifted plan yields to the ranking, which prefers safe calls.
-    if (nextCallSafe(planned.probe.provider.id)) {
+    // The planned pick goes first while it is still safe: under a
+    // derived schedule, its next call inside the safe run; blind,
+    // the plan already priced its overflow, so it goes first
+    // whenever its provider is not dropped. A drifted plan yields
+    // to the ranking, which prefers safe calls.
+    if (schedule === null || nextCallSafe(planned.probe.provider.id)) {
       push({ probe: planned.probe, model: planned.model, row, rating: row?.rating_milli ?? 0, caps });
     }
   }
