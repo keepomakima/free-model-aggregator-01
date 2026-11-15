@@ -64,7 +64,7 @@ const ANTHROPIC_VERSION = '2023-06-01';
 /** Calls per provider under a blind plan: a first call always succeeds, so two each spreads the risk. */
 const BLIND_CAP = 2;
 /** Flow cost of one call past the blind cap, in weighted rating milli-points: the flow spends it only when the rating gained beats it. */
-const BLIND_OVERFLOW_PENALTY = 60;
+const BLIND_OVERFLOW_PENALTY = 25;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
