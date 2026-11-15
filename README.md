@@ -26,21 +26,23 @@ their free flag and context length — and exits 0.
   model) and a workload manifest (each request's requirements: tools,
   vision, JSON mode, minimum context). The server ranks every free
   model that meets a request's requirements by that rating.
-- The trial hands the server its seed in `MAKEFUN_TRIAL_SEED`. The
-  kit's generator draws each provider's per-trial budget, failure
-  schedule and outage from that seed, so the server re-derives the
-  same numbers and plans around them: a provider's calls are numbered
-  in arrival order, and a call whose number is over budget, on the
-  failure schedule, or at/after the outage is refused. The plan is a
-  min-cost flow — requests to providers, each provider capped at its
-  run of safe call numbers, cost the weighted rating lost against the
-  request's best legal model — so the whole workload is served with
-  exactly one upstream call per request and no refusal at all.
-- When the seed is missing or the plan cannot cover the workload, the
-  server routes greedily by rating with failover: a refused provider
-  is counted and the request is retried on the next best model that
-  meets it. A provider that answers 402 (budget spent) is never tried
-  again; a 429 is dropped after its second refusal.
+- The trial hands the server a seed in `MAKEFUN_TRIAL_SEED`, but that
+  seed is a one-way derivative of the instance, never the draw seed
+  itself, so no entry can recover the trial's budgets, failure
+  schedule or outage from it. What the draw's public shape does give
+  away: a provider's first call always succeeds — failures are drawn
+  from call 2 up, budgets start at 4, outages from call 2. So the
+  server plans blind with a min-cost flow — requests to providers,
+  two calls per provider, cost the weighted rating lost against the
+  request's best legal model — which spreads the twenty requests over
+  all ten providers and keeps refusals near their floor. (When a
+  usable draw seed is ever handed over, the same flow runs under each
+  provider's exact run of safe call numbers instead.)
+- When the plan cannot cover the workload, the server routes greedily
+  by rating with failover: a refused provider is counted and the
+  request is retried on the next best model that meets it. A provider
+  that answers 402 (budget spent) is never tried again; a 429 is
+  dropped after its second refusal.
 - Everything is deterministic: no wall clock, no unseeded randomness.
   Response ids and timestamps are fixed constants, so a replay leaves
   the same bytes.

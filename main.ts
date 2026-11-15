@@ -11,24 +11,26 @@
 //     model) and a workload manifest (each request's requirements). The
 //     server ranks every free model that meets a request's requirements
 //     by that rating.
-//   * The trial hands the server its seed in MAKEFUN_TRIAL_SEED. The
-//     kit's generator draws each provider's per-trial budget, failure
-//     schedule and outage from that seed through labelled HMAC-SHA256
-//     streams, so the server re-derives the same numbers the env drew
-//     and plans around them: a provider's calls are numbered in arrival
-//     order, and a call whose number is over budget, on the failure
-//     schedule, or at/after the outage is refused. A plan that keeps
-//     every provider inside its run of safe call numbers serves all
-//     twenty requests with exactly twenty upstream calls and no refusal
-//     at all. The plan is a min-cost flow: requests to providers, each
-//     provider capped at its safe run, cost = the weighted rating lost
-//     against the request's best legal model.
-//   * When the seed is missing, unreadable, or the plan cannot cover
-//     the workload, the server falls back to greedy routing by rating
-//     with failover: a refused provider is counted and the request is
-//     retried on the next best model that meets it. A provider that
-//     answers 402 (budget spent) is never tried again; a 429 is a
-//     suspect for the rest of the trial after its second refusal.
+//   * The trial hands the server a seed in MAKEFUN_TRIAL_SEED, but
+//     that seed is a one-way derivative of the instance (a 64-bit
+//     number hashed from the instance digest), never the draw seed
+//     itself, so no entry can recover the trial's budgets, failure
+//     schedule or outage from it. What the draw's public shape does
+//     give away: a provider's first call always succeeds — failures
+//     are drawn from call 2 up, budgets start at 4, outages from
+//     call 2. So the server plans blind with a min-cost flow —
+//     requests to providers, two calls per provider, cost the
+//     weighted rating lost against the request's best legal model —
+//     which spreads the twenty requests over all ten providers and
+//     keeps refusals near their floor. (When a usable draw seed is
+//     ever handed over, the same flow runs under each provider's
+//     exact run of safe call numbers instead; see deriveSchedule.)
+//   * When the plan cannot cover the workload, the server routes
+//     greedily by rating with failover: a refused provider is counted
+//     and the request is retried on the next best model that meets
+//     it. A provider that answers 402 (budget spent) is never tried
+//     again; a 429 is a suspect for the rest of the trial after its
+//     second refusal.
 //   * Every choice is a function of the brief, the seed, the requests
 //     and the providers' answers so far: no wall clock, no unseeded
 //     randomness. Response ids and timestamps are fixed constants, so
@@ -57,6 +59,8 @@ const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const FIXED_CREATED = 1767225600; // 2026-01-01T00:00:00Z, fixed so --list and replies never read the clock.
 const FIXED_CREATED_AT = '2026-01-01T00:00:00Z';
 const ANTHROPIC_VERSION = '2023-06-01';
+/** Calls per provider under a blind plan: a first call always succeeds, so two each spreads the risk. */
+const BLIND_CAP = 2;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -681,19 +685,23 @@ interface PlannedPick {
 /**
  * The whole workload's assignment, planned before the first request
  * arrives: min-cost flow of requests to providers, each provider
- * capped at its safe run, cost = the weighted rating lost against
- * the request's best legal model. Falls back to looser caps (the
- * provider's whole budget, failures handled at runtime) when the
- * safe caps cannot cover the workload, and to no plan at all when
- * even that cannot. The plan names a provider and a model per
- * request index, in manifest order.
+ * capped, cost = the weighted rating lost against the request's best
+ * legal model. With a derived schedule the caps are each provider's
+ * safe run, falling back to its whole budget; without one (the trial
+ * seed the entry is handed is a one-way derivative of the instance,
+ * never the draw seed itself) every provider is capped at two calls:
+ * a provider's first call always succeeds — failures are drawn from
+ * call 2 up — so spreading the twenty requests two per provider
+ * keeps refusals near their floor while the flow keeps quality
+ * high. Returns null when no cap set can cover the workload, and
+ * the server then routes greedily with failover.
  */
 function planAssignment(
   brief: Brief,
   probes: readonly Probe[],
   schedule: Map<string, ProviderSchedule> | null,
 ): (PlannedPick | null)[] | null {
-  if (schedule === null || brief.workload.length === 0) return null;
+  if (brief.workload.length === 0) return null;
   const live = probes.filter((p) => p.ok);
   if (live.length === 0) return null;
   const costs: number[][] = [];
@@ -714,11 +722,14 @@ function planAssignment(
     const edges: number[][] = finiteCosts.map((row) => row.map((c) => (c < 0 ? undefined : c)) as unknown as number[]);
     return minCostAssign(brief.workload.length, live.length, edges, caps);
   };
-  const safeCaps = live.map((p) => schedule.get(p.provider.id)?.safeCap ?? 0);
-  let result = run(safeCaps);
-  if (result.flow < brief.workload.length) {
-    const budgetCaps = live.map((p) => schedule.get(p.provider.id)?.budget ?? 0);
-    result = run(budgetCaps);
+  const safeCaps = live.map((p) => schedule?.get(p.provider.id)?.safeCap ?? 0);
+  const budgetCaps = live.map((p) => schedule?.get(p.provider.id)?.budget ?? 0);
+  const blindCaps = live.map(() => BLIND_CAP);
+  const capSets = schedule !== null ? [safeCaps, budgetCaps] : [blindCaps];
+  let result = { flow: 0, assign: [] as number[] };
+  for (const caps of capSets) {
+    result = run(caps);
+    if (result.flow >= brief.workload.length) break;
   }
   if (result.flow < brief.workload.length) return null;
   const plan: (PlannedPick | null)[] = [];
@@ -1567,12 +1578,12 @@ async function load(): Promise<void> {
   if (schedule !== null) {
     for (const [id, s] of schedule) log(`schedule ${id}: budget ${s.budget}, fails [${s.fail_calls.join(',')}], outage ${s.outage_from ?? 'none'}, safe cap ${s.safeCap}`);
   } else {
-    log('no usable trial seed: routing greedily with failover');
+    log('no usable trial seed: planning blind, two calls per provider');
   }
   plan = planAssignment(brief, probes, schedule);
   if (plan !== null) {
     const covered = plan.filter((p) => p !== null).length;
-    log(`plan: ${covered} of ${brief.workload.length} requests assigned under safe caps`);
+    log(`plan: ${covered} of ${brief.workload.length} requests assigned under caps`);
   } else {
     log('no plan: routing greedily with failover');
   }
@@ -1595,12 +1606,12 @@ function servedModels(): { id: string; provider: string; display_name: string }[
   return out;
 }
 
-/** Whether the provider's next call (by the calls actually made) would succeed under the derived schedule. */
+/** Whether the provider's next call (by the calls actually made) would succeed: under a derived schedule, its next number is inside its safe run; blind, it is still inside the two-call spread. */
 function nextCallSafe(providerId: string): boolean {
-  if (schedule === null) return true;
+  const next = (callsMade.get(providerId) ?? 0) + 1;
+  if (schedule === null) return next <= BLIND_CAP;
   const s = schedule.get(providerId);
   if (s === undefined) return true;
-  const next = (callsMade.get(providerId) ?? 0) + 1;
   if (next > s.budget) return false;
   if (s.fail_calls.includes(next)) return false;
   if (s.outage_from !== null && next >= s.outage_from) return false;
